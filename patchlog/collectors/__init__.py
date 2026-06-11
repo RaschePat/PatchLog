@@ -1,0 +1,2 @@
+"""Patch-note collectors."""
+

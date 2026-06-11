@@ -1,0 +1,1 @@
+"""Static asset lookup helpers."""
