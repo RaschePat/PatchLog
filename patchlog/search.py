@@ -15,7 +15,10 @@ def main() -> None:
     if args.change_type:
         where["change_type"] = args.change_type
 
-    store = ChromaPatchStore(persist_path=Path.cwd() / "data" / "chroma")
+    store = ChromaPatchStore(
+        persist_path=Path.cwd() / "data" / "chroma",
+        embedding_backend=args.embedding,
+    )
     rows = store.search(query=args.query, where=where, top_k=args.top_k)
     if not rows:
         print("No results")
@@ -36,13 +39,14 @@ def main() -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Search indexed patch-note chunks")
     parser.add_argument("query")
-    parser.add_argument("--game", choices=["lol"], default="lol")
+    parser.add_argument("--game", choices=["lol", "valorant", "overwatch"], default="lol")
     parser.add_argument("--target")
     parser.add_argument(
         "--change-type",
         choices=["buff", "nerf", "rework", "adjust", "bugfix", "new"],
     )
     parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--embedding", choices=["bge-m3", "hash"])
     return parser.parse_args()
 
 

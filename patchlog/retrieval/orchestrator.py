@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from patchlog.config import GAME_LABELS, VALID_GAMES
+from patchlog.config import GAME_LABELS, VALID_GAMES, settings
 from patchlog.dashboard import build_patch_dashboard, summarize_document
+from patchlog.generation.openai import LLMConfigurationError, OpenAIAnswerGenerator
 from patchlog.models import ChatMessage, ChatResult, Game, PatchChunk
 from patchlog.retrieval.self_query import analyze_query, has_unknown_explicit_target, is_patch_followup
 from patchlog.store.chroma import ChromaPatchStore
@@ -24,6 +25,9 @@ class RetrievedPatchChunk:
     content: str
     section: str = "champion"
     distance: float | None = None
+    parent_chunk_id: str | None = None
+    matched_child_id: str | None = None
+    matched_child_content: str | None = None
 
     def source_dict(self) -> dict[str, Any]:
         return {
@@ -37,12 +41,22 @@ class RetrievedPatchChunk:
             "section": self.section,
             "distance": self.distance,
             "content": self.content,
+            "parent_chunk_id": self.parent_chunk_id,
+            "matched_child_id": self.matched_child_id,
         }
 
 
 class ChatOrchestrator:
-    def __init__(self, store: InMemoryPatchStore | ChromaPatchStore | None = None) -> None:
+    def __init__(
+        self,
+        store: InMemoryPatchStore | ChromaPatchStore | None = None,
+        *,
+        llm_backend: str | None = None,
+        answer_generator: OpenAIAnswerGenerator | None = None,
+    ) -> None:
         self.store = store or InMemoryPatchStore()
+        self.llm_backend = (llm_backend or settings.llm_backend).strip().lower()
+        self.answer_generator = answer_generator or OpenAIAnswerGenerator(model=settings.llm_model)
 
     def chat(
         self,
@@ -60,7 +74,7 @@ class ChatOrchestrator:
         known_targets = _known_targets(self.store, game)
         analysis = analyze_query(message, game, history, known_targets=known_targets)
         if has_unknown_explicit_target(message, game, known_targets=known_targets):
-            debug_trace = _debug_trace(analysis.query, {"game": game}, [], debug)
+            debug_trace = _debug_trace(self, analysis.query, {"game": game}, [], debug)
             return ChatResult(
                 answer=f"수집된 {GAME_LABELS[game]} 패치노트에서 해당 대상을 찾지 못했습니다.",
                 sources=[],
@@ -71,7 +85,7 @@ class ChatOrchestrator:
             message,
             known_targets=known_targets,
         ):
-            debug_trace = _debug_trace(analysis.query, {"game": game}, [], debug)
+            debug_trace = _debug_trace(self, analysis.query, {"game": game}, [], debug)
             return ChatResult(
                 answer=_off_topic_answer(game),
                 sources=[],
@@ -89,7 +103,7 @@ class ChatOrchestrator:
         chunks = chunks[:3]
 
         if not chunks:
-            debug_trace = _debug_trace(analysis.query, final_filter, [], debug)
+            debug_trace = _debug_trace(self, analysis.query, final_filter, [], debug)
             return ChatResult(
                 answer=f"수집된 {GAME_LABELS[game]} 패치노트에서 찾지 못했습니다.",
                 sources=[],
@@ -98,9 +112,19 @@ class ChatOrchestrator:
             )
 
         sources = [chunk.source_dict() for chunk in chunks]
-        answer = _build_answer(chunks, final_filter)
+        try:
+            answer = self._generate_answer(
+                game=game,
+                message=message,
+                chunks=chunks,
+                final_filter=final_filter,
+            )
+            generation = f"{self.llm_backend}_answer_from_retrieved_chunks"
+        except LLMConfigurationError as exc:
+            answer = str(exc)
+            generation = "llm_configuration_error"
         navigation_target = _navigation_target(chunks[0])
-        debug_trace = _debug_trace(analysis.query, final_filter, sources, debug)
+        debug_trace = _debug_trace(self, analysis.query, final_filter, sources, debug, generation=generation)
         return ChatResult(
             answer=answer,
             sources=sources,
@@ -141,6 +165,25 @@ class ChatOrchestrator:
             return build_patch_dashboard(self.store.list_chunks(game=game))
         return []
 
+    def _generate_answer(
+        self,
+        *,
+        game: Game,
+        message: str,
+        chunks: list[RetrievedPatchChunk],
+        final_filter: dict[str, Any],
+    ) -> str:
+        if self.llm_backend == "template":
+            return _build_answer(chunks, final_filter)
+        if self.llm_backend != "openai":
+            raise ValueError("Unsupported LLM backend. Use 'openai' or 'template'.")
+        return self.answer_generator.generate(
+            game=game,
+            message=message,
+            chunks=chunks,
+            final_filter=final_filter,
+        )
+
     def _latest_patch_chat(self, *, game: Game, debug: bool) -> ChatResult | None:
         patches = self.patches(game=game)
         if not patches:
@@ -172,6 +215,10 @@ class ChatOrchestrator:
                 "query": "latest_patch",
                 "final_filter": {"game": game, "patch_version": latest["patch_version"]},
                 "retrieved_chunks": sources,
+                "retrieved_child_ids": [],
+                "resolved_parent_ids": [source.get("chunk_id") for source in sources if source.get("chunk_id")],
+                "embedding_backend": getattr(self.store, "embedding_backend", "in_memory"),
+                "llm_backend": self.llm_backend,
                 "generation": "latest_patch_dashboard_summary",
             }
         return ChatResult(
@@ -186,7 +233,7 @@ def create_api_orchestrator(root: Path | None = None) -> ChatOrchestrator:
     root = root or Path.cwd()
     chroma_path = root / "data" / "chroma"
     if (chroma_path / "chroma.sqlite3").exists():
-        store = ChromaPatchStore(persist_path=chroma_path)
+        store = ChromaPatchStore(persist_path=chroma_path, embedding_backend=settings.embedding_backend)
         if store.count() > 0:
             return ChatOrchestrator(store=store)
     return ChatOrchestrator()
@@ -235,6 +282,9 @@ def _from_chroma_row(row: dict[str, Any]) -> RetrievedPatchChunk:
         content=row["document"],
         section=metadata.get("section", "champion"),
         distance=row.get("distance"),
+        parent_chunk_id=metadata.get("parent_chunk_id"),
+        matched_child_id=row.get("matched_child_id"),
+        matched_child_content=row.get("matched_child_document"),
     )
 
 
@@ -451,18 +501,26 @@ def _subject_marker(text: str) -> str:
 
 
 def _debug_trace(
+    orchestrator: ChatOrchestrator,
     query: str,
     final_filter: dict[str, Any],
     sources: list[dict[str, Any]],
     debug: bool,
+    *,
+    generation: str = "template_answer_from_retrieved_chunks",
 ) -> dict[str, Any] | None:
     if not debug:
         return None
+    embedding_backend = getattr(orchestrator.store, "embedding_backend", "in_memory")
     return {
         "query": query,
         "final_filter": final_filter,
         "retrieved_chunks": sources,
-        "generation": "template_answer_from_retrieved_chunks",
+        "retrieved_child_ids": [source.get("matched_child_id") for source in sources if source.get("matched_child_id")],
+        "resolved_parent_ids": [source.get("chunk_id") for source in sources if source.get("chunk_id")],
+        "embedding_backend": embedding_backend,
+        "llm_backend": orchestrator.llm_backend,
+        "generation": generation,
     }
 
 

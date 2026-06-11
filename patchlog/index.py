@@ -18,7 +18,10 @@ def main() -> None:
 
     root = Path.cwd()
     processed_dir = root / "data" / "processed" / args.game
-    store = ChromaPatchStore(persist_path=root / "data" / "chroma")
+    store = ChromaPatchStore(
+        persist_path=root / "data" / "chroma",
+        embedding_backend=args.embedding,
+    )
 
     chunks = []
     for meta_path in sorted(processed_dir.glob("*.meta.json")):
@@ -40,6 +43,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Index processed patch-note chunks")
     parser.add_argument("--game", choices=SUPPORTED_GAMES, required=True)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--embedding", choices=["bge-m3", "hash"])
     return parser.parse_args()
 
 
